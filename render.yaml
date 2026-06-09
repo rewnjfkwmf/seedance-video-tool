@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: seedance-backend
+    runtime: docker
+    rootDir: backend
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: SEEDANCE_CORS_ORIGINS
+        value: "*"
+      - key: SEEDANCE_DATA_DIR
+        value: /app/data

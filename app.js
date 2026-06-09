@@ -5,6 +5,16 @@ import {
 } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js";
 const { createWorker } = window.Tesseract;
 
+function getApiBase() {
+  const params = new URLSearchParams(window.location.search);
+  return (
+    params.get("api") ||
+    window.__SEEDANCE_API_BASE__ ||
+    localStorage.getItem("seedance_api_base") ||
+    "http://127.0.0.1:9000"
+  );
+}
+
 const state = {
   sourceUrl: "",
   sourceType: "",
@@ -24,7 +34,11 @@ const state = {
   ocrLanguage: "",
   ocrLoadingPromise: null,
   logs: [],
+  currentJobId: "",
+  backendResultMeta: null,
 };
+
+const API_BASE = getApiBase();
 
 const elements = {
   fileInput: document.querySelector("#fileInput"),
@@ -120,6 +134,8 @@ function resetSourceCache() {
   state.sourceBytes = null;
   state.ffmpegInputName = "";
   state.segments = [];
+  state.currentJobId = "";
+  state.backendResultMeta = null;
 }
 
 function loadVideoSource(url, sourceType, sourceFile = null) {
@@ -329,6 +345,156 @@ function buildSegmentCameraSummary(segment) {
 
 function buildSegmentVoiceoverSummary(segment) {
   return segment.shotScripts.map((shot) => shot.voiceover).join("");
+}
+
+function normalizeBackendShot(shot) {
+  return {
+    index: Number(shot.index || 0),
+    time: shot.time || "",
+    visual: shot.visual || "",
+    cameraMotion: shot.camera_motion || shot.cameraMotion || "",
+    voiceover: shot.voiceover || "",
+  };
+}
+
+function buildSegmentsFromBackendResult(result) {
+  const segments = (result.segments || []).map((segment) => {
+    const shotScripts = (segment.shots || []).map(normalizeBackendShot);
+    const firstIndex = shotScripts[0]?.index || 1;
+    const lastIndex = shotScripts.at(-1)?.index || shotScripts.length || 1;
+    const parsedRange = (segment.time || "").split("-");
+    const start = parsedRange[0]
+      ? Number((parsedRange[0] || "00:00.0").split(":")[0]) * 60 +
+        Number((parsedRange[0] || "00:00.0").split(":")[1] || 0)
+      : 0;
+    const end = parsedRange[1]
+      ? Number((parsedRange[1] || "00:00.0").split(":")[0]) * 60 +
+        Number((parsedRange[1] || "00:00.0").split(":")[1] || 0)
+      : start;
+
+    const normalized = {
+      id: `segment-${segment.index}`,
+      index: Number(segment.index || 0),
+      start,
+      end,
+      thumb: "",
+      shots: shotScripts.map((shot) => ({
+        index: shot.index,
+        start: 0,
+        end: 0,
+        ocrText: "",
+      })),
+      shotScripts,
+      role: segment.label || toChineseSegmentLabel(Number(segment.index || 1)),
+      shotBreakdown:
+        shotScripts
+          .map(
+            (shot) =>
+              `镜头${shot.index}\n时间：${shot.time}\n画面：${shot.visual}\n镜头运动：${shot.cameraMotion}\n旁白：${shot.voiceover}`,
+          )
+          .join("\n\n") || "",
+      scene: segment.visuals || "",
+      camera: segment.camera_motion || "",
+      action: segment.voiceover || "",
+      ocrText: "",
+      prompt: segment.copy_prompt || segment.prompt || "",
+      backendShotRange: `${firstIndex}-${lastIndex}`,
+    };
+    normalized.prompt ||= buildPrompt(normalized);
+    return normalized;
+  });
+
+  return segments;
+}
+
+async function ensureBackendReachable() {
+  const response = await fetch(`${API_BASE}/api/health`);
+  if (!response.ok) {
+    throw new Error("后端健康检查失败");
+  }
+  return response.json();
+}
+
+async function ensureUploadBlob() {
+  if (state.sourceFile) {
+    return state.sourceFile;
+  }
+
+  if (state.sourceType === "url" && state.sourceUrl) {
+    pushLog("正在抓取链接视频并转交后端...");
+    const response = await fetch(state.sourceUrl);
+    if (!response.ok) {
+      throw new Error("链接视频抓取失败，请改用本地上传。");
+    }
+    const blob = await response.blob();
+    const ext = guessExtension(state.sourceUrl) || "mp4";
+    return new File([blob], `remote-video.${ext}`, { type: blob.type || "video/mp4" });
+  }
+
+  throw new Error("当前没有可上传的视频文件。");
+}
+
+async function createBackendJob() {
+  const config = getAnalysisConfig();
+  const uploadFile = await ensureUploadBlob();
+  const formData = new FormData();
+  formData.append("file", uploadFile);
+  formData.append("analysis_mode", config.mode);
+  formData.append("segment_max_seconds", String(config.maxSegmentSeconds));
+
+  const response = await fetch(`${API_BASE}/api/jobs`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let detail = "创建任务失败";
+    try {
+      const payload = await response.json();
+      detail = payload.detail || detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+
+  return response.json();
+}
+
+async function pollBackendJob(jobId) {
+  const maxTries = 240;
+  for (let count = 0; count < maxTries; count += 1) {
+    const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+    if (!response.ok) {
+      throw new Error("查询任务状态失败");
+    }
+    const payload = await response.json();
+    if (payload.status === "completed") {
+      return payload;
+    }
+    if (payload.status === "failed") {
+      throw new Error(payload.error || "后端任务执行失败");
+    }
+    setStatus(payload.status === "processing" ? "后端处理中" : "任务排队中", "idle");
+    pushLog(`后端任务 ${jobId.slice(0, 8)} 状态：${payload.status}`);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error("等待后端结果超时，请稍后重试。");
+}
+
+async function fetchBackendResult(jobId) {
+  const response = await fetch(`${API_BASE}/api/jobs/${jobId}/result`);
+  if (!response.ok) {
+    let detail = "获取结果失败";
+    try {
+      const payload = await response.json();
+      detail = payload.detail || detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return response.json();
 }
 
 function getAnalysisConfig() {
@@ -824,9 +990,6 @@ async function recognizeTextFromImage(imageDataUrl, index) {
 }
 
 async function buildSegments() {
-  const config = getAnalysisConfig();
-  const segmentLength = config.maxSegmentSeconds;
-
   if (!state.sourceUrl) {
     alert("请先导入视频。");
     return;
@@ -844,87 +1007,37 @@ async function buildSegments() {
     return;
   }
 
-  setStatus("生成分段中", "idle");
-  elements.emptyState.textContent = "正在按原镜头分析、抽帧、OCR 并打包为 Seedance 段，请稍候...";
-  pushLog(
-    `开始分析原视频镜头，再按不超过 ${segmentLength}s 打包为 Seedance 段...当前模式：${
-      config.mode === "detail" ? "精细模式" : "极速模式"
-    }`,
-  );
+  const config = getAnalysisConfig();
+  setStatus("提交后端任务", "idle");
+  elements.emptyState.textContent = "正在把视频提交给后端分析服务，请稍候...";
+  pushLog(`开始提交后端任务...当前模式：${config.mode === "detail" ? "精细模式" : "极速模式"}`);
 
-  const shouldRunOcr = config.runOcr;
+  try {
+    await ensureBackendReachable();
+    const job = await createBackendJob();
+    state.currentJobId = job.job_id;
+    pushLog(`后端任务已创建：${job.job_id}`);
+    setStatus("任务已提交", "idle");
+    elements.emptyState.textContent = "后端正在分析视频，请稍候...";
 
-  if (shouldRunOcr) {
-    try {
-      await ensureOCRWorker();
-    } catch (error) {
-      pushLog(`OCR 预加载失败，跳过文字识别：${error.message}`);
-    }
+    await pollBackendJob(job.job_id);
+    const result = await fetchBackendResult(job.job_id);
+    state.backendResultMeta = result.meta || null;
+    state.segments = buildSegmentsFromBackendResult(result);
+    renderSegments();
+
+    const meta = result.meta || {};
+    const originalShotCount = meta.original_shot_count ?? "-";
+    elements.videoMeta.textContent = `${state.sourceType === "url" ? "链接导入" : "本地上传"} | 总时长 ${formatTime(state.duration)} | 原镜头 ${originalShotCount} 个 | Seedance 段 ${state.segments.length} 个`;
+    setStatus("拆段完成", "ok");
+    pushLog(`后端分析完成：共 ${originalShotCount} 个原镜头，已生成 ${state.segments.length} 个 Seedance 段。`);
+  } catch (error) {
+    console.error(error);
+    setStatus("后端分析失败", "warn");
+    elements.emptyState.textContent = "后端分析失败，请检查后端服务是否启动。";
+    pushLog(`后端分析失败：${error.message}`);
+    alert(`后端分析失败：${error.message}\n\n请先启动后端服务，例如：uvicorn app.main:app --app-dir /workspace/backend --host 0.0.0.0 --port 9000 --reload`);
   }
-
-  const boundaries = await detectOriginalShotBoundaries();
-  const shots = buildShotsFromBoundaries(boundaries);
-
-  const seedanceChunks = packageShotsForSeedance(shots, segmentLength);
-  const sampledShotIndexes = selectSampledShotIndexes(seedanceChunks, config);
-
-  for (const shot of shots) {
-    if (!sampledShotIndexes.has(shot.index)) continue;
-    const middle = Math.min(shot.start + (shot.end - shot.start) / 2, state.duration - 0.2);
-    shot.thumb = await generateThumbnail(middle, shot.index);
-    if (shouldRunOcr && state.ocrWorker) {
-      try {
-        shot.ocrText = await recognizeTextFromImage(shot.thumb, shot.index);
-      } catch (error) {
-        pushLog(`镜头 ${shot.index} OCR 失败：${error.message}`);
-      }
-    }
-  }
-
-  const results = [];
-
-  for (let index = 0; index < seedanceChunks.length; index += 1) {
-    const chunk = seedanceChunks[index];
-    const hint = narrativeHint(index, seedanceChunks.length);
-    const firstThumb = chunk.shots.find((shot) => shot.thumb)?.thumb || "";
-    const mergedOcr = [...new Set(chunk.shots.map((shot) => shot.ocrText).filter(Boolean))].join("；");
-    const shotBreakdown = chunk.shots.map((shot) => summarizeShot(shot)).join("\n");
-
-    const segment = {
-      id: `segment-${index + 1}`,
-      index: index + 1,
-      start: chunk.start,
-      end: chunk.end,
-      thumb: firstThumb,
-      shots: chunk.shots,
-      role: hint.role,
-      shotBreakdown,
-      scene: summarizeChunkScene(chunk.shots),
-      action: summarizeChunkAction(chunk.shots),
-      ocrText: mergedOcr,
-      shotScripts: chunk.shots.map((shot, idx) => buildShotScript(shot, { shots: chunk.shots }, idx)),
-      camera: "",
-      prompt: "",
-    };
-
-    segment.shotBreakdown = buildSegmentBreakdown(segment);
-    segment.scene = buildSegmentVisualSummary(segment);
-    segment.camera = buildSegmentCameraSummary(segment);
-    segment.action = buildSegmentVoiceoverSummary(segment);
-
-    results.push({
-      ...segment,
-      prompt: buildPrompt(segment),
-    });
-  }
-
-  state.segments = results;
-  renderSegments();
-  setStatus("拆段完成", "ok");
-  elements.videoMeta.textContent = `${state.sourceType === "url" ? "链接导入" : "本地上传"} | 总时长 ${formatTime(state.duration)} | 原镜头 ${shots.length} 个 | Seedance 段 ${state.segments.length} 个`;
-  pushLog(
-    `原镜头分析完成：共 ${shots.length} 个原镜头，已打包为 ${state.segments.length} 个 Seedance 段。本次实际抽帧 ${sampledShotIndexes.size} 个。`,
-  );
 }
 
 async function exportSegmentClip(segment, button) {
@@ -1046,7 +1159,7 @@ function renderSegments() {
     const downloadBtn = fragment.querySelector(".download-btn");
 
     title.textContent = `第 ${segment.index} 段`;
-    time.textContent = `${formatRange(segment.start, segment.end)} | 镜头 ${segment.shotScripts[0]?.index || 1}-${segment.shotScripts.at(-1)?.index || segment.shotScripts.length}`;
+    time.textContent = `${formatRange(segment.start, segment.end)} | 镜头 ${segment.backendShotRange || `${segment.shotScripts[0]?.index || 1}-${segment.shotScripts.at(-1)?.index || segment.shotScripts.length}`}`;
     thumb.src =
       segment.thumb ||
       "data:image/svg+xml;charset=UTF-8," +
@@ -1135,6 +1248,8 @@ function exportJson() {
         sourceType: state.sourceType,
         duration: state.duration,
         segmentLength: Number(elements.segmentLength.value) || 15,
+        backendJobId: state.currentJobId,
+        backendResultMeta: state.backendResultMeta,
         theme: elements.videoTheme.value.trim(),
         subject: elements.mainSubject.value.trim(),
         visualStyle: elements.visualStyle.value,
@@ -1210,6 +1325,7 @@ function bindEvents() {
 attachVideoEvents();
 bindEvents();
 pushLog("页面已加载，可先导入 2 分钟内视频，再生成拆段结果。");
+pushLog(`当前前端默认调用后端接口：${API_BASE}`);
 
 window.__seedance = {
   state,
