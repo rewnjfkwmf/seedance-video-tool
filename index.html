@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Seedance 视频拆段提示词分享版</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">纯前端分享版</p>
+          <h1>Seedance 2.0 视频拆段与提示词工具</h1>
+          <p class="hero-text">
+            上传 2 分钟内视频或粘贴直链，自动按 15 秒拆段，支持浏览器端真实切片导出、
+            OCR 识别画面文字，并逐段生成适合 Seedance 2.0 的视频提示词。
+          </p>
+        </div>
+        <div class="hero-tips">
+          <span>仅浏览器运行</span>
+          <span>FFmpeg.wasm 切片</span>
+          <span>Tesseract.js OCR</span>
+          <span>适合静态托管分享</span>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel">
+          <div class="panel-title">
+            <h2>1. 视频输入</h2>
+            <p>上传 2 分钟内视频后，直接生成结构化 Seedance 提示词。链接导入仅适用于允许跨域访问的直链视频。</p>
+          </div>
+
+          <div class="input-grid">
+            <label class="field">
+              <span>上传视频</span>
+              <input id="fileInput" type="file" accept="video/*" />
+            </label>
+
+            <div class="field">
+              <span>视频直链</span>
+              <div class="inline-row">
+                <input
+                  id="urlInput"
+                  type="url"
+                  placeholder="https://example.com/demo.mp4"
+                />
+                <button id="loadUrlBtn" class="secondary">加载链接</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="status-row">
+            <span id="statusBadge" class="badge idle">等待导入视频</span>
+            <span id="videoMeta" class="meta-text">未加载视频</span>
+          </div>
+
+          <div class="quick-actions">
+            <label class="field compact-field">
+              <span>生成模式</span>
+              <select id="analysisMode">
+                <option value="fast">极速模式</option>
+                <option value="detail">精细模式</option>
+              </select>
+            </label>
+
+            <div class="actions compact-actions">
+              <button id="analyzeBtn">生成拆段结果</button>
+              <button id="exportTxtBtn" class="secondary">导出 TXT</button>
+              <button id="exportJsonBtn" class="secondary">导出 JSON</button>
+              <button id="exportAllClipsBtn" class="secondary">导出全部切片</button>
+            </div>
+          </div>
+
+          <video id="videoPreview" controls playsinline preload="metadata"></video>
+        </section>
+
+        <section class="panel" hidden>
+          <div class="panel-title">
+            <h2>2. 引擎与设置</h2>
+            <p>FFmpeg 首次加载约 30MB；OCR 首次加载会下载语言模型。页面已适配静态托管直接发布。</p>
+          </div>
+
+          <div class="engine-grid">
+            <div class="engine-card">
+              <div class="engine-head">
+                <strong>FFmpeg.wasm</strong>
+                <span id="ffmpegBadge" class="badge idle">未加载</span>
+              </div>
+              <p>用于真实浏览器端切片导出，无需后端。</p>
+              <button id="loadFfmpegBtn" class="secondary">预加载 FFmpeg</button>
+            </div>
+
+            <div class="engine-card">
+              <div class="engine-head">
+                <strong>Tesseract.js OCR</strong>
+                <span id="ocrBadge" class="badge idle">未加载</span>
+              </div>
+              <p>用于识别视频关键帧中的画面文字，自动注入 Prompt。</p>
+              <button id="warmupOcrBtn" class="secondary">预加载 OCR</button>
+            </div>
+          </div>
+
+          <div class="field top-gap">
+            <span>任务日志</span>
+            <textarea id="processingLog" rows="6" readonly placeholder="这里会显示 FFmpeg / OCR 的执行日志"></textarea>
+          </div>
+        </section>
+
+        <section class="panel" hidden>
+          <div class="panel-title">
+            <h2>3. 拆段与生成设置</h2>
+            <p>这里不是按 15 秒硬切原视频，而是先按原镜头分析，再把多个原镜头打包成不超过 15 秒的 Seedance 段。</p>
+          </div>
+
+          <div class="settings-grid">
+            <label class="field">
+              <span>Seedance 单段上限（秒）</span>
+              <input id="segmentLength" type="number" min="5" max="15" value="15" />
+            </label>
+
+            <label class="field">
+              <span>视频主题</span>
+              <input id="videoTheme" type="text" placeholder="例如：护肤产品演示 / Vlog / 剧情短片" />
+            </label>
+
+            <label class="field">
+              <span>主角 / 主体</span>
+              <input id="mainSubject" type="text" placeholder="例如：女生、产品、宠物、城市街景" />
+            </label>
+
+            <label class="field">
+              <span>画面风格</span>
+              <select id="visualStyle">
+                <option value="写实电影感">写实电影感</option>
+                <option value="高转化广告感">高转化广告感</option>
+                <option value="生活方式 Vlog">生活方式 Vlog</option>
+                <option value="未来科技感">未来科技感</option>
+                <option value="二次元梦幻感">二次元梦幻感</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>镜头节奏</span>
+              <select id="cameraRhythm">
+                <option value="平稳推进">平稳推进</option>
+                <option value="快节奏切换">快节奏切换</option>
+                <option value="跟拍沉浸感">跟拍沉浸感</option>
+                <option value="高级定镜">高级定镜</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>光线氛围</span>
+              <select id="moodTone">
+                <option value="自然柔光">自然柔光</option>
+                <option value="明亮商业光">明亮商业光</option>
+                <option value="夜景霓虹">夜景霓虹</option>
+                <option value="高级冷调">高级冷调</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>OCR 语言</span>
+              <select id="ocrLanguage">
+                <option value="eng+chi_sim">中英混合</option>
+                <option value="chi_sim">中文</option>
+                <option value="eng">英文</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Prompt 模板</span>
+              <select id="promptMode">
+                <option value="广告转化">广告转化</option>
+                <option value="剧情分镜">剧情分镜</option>
+                <option value="Vlog 记录">Vlog 记录</option>
+                <option value="产品演示">产品演示</option>
+              </select>
+            </label>
+
+            <label class="field checkbox-field">
+              <span>自动 OCR</span>
+              <label class="checkbox-inline">
+                <input id="enableOcr" type="checkbox" checked />
+                <span>分析分段时同步识别关键帧文字</span>
+              </label>
+            </label>
+
+            <label class="field full-width">
+              <span>补充说明</span>
+              <textarea
+                id="extraNotes"
+                rows="3"
+                placeholder="例如：突出产品质感、人物微表情、转场自然、镜头不要太晃"
+              ></textarea>
+            </label>
+
+            <label class="field full-width">
+              <span>负向提示词</span>
+              <textarea
+                id="negativePrompt"
+                rows="3"
+                placeholder="例如：低清晰度、畸形手部、画面闪烁、过度锐化、字幕遮挡主体"
+              ></textarea>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="regenerateBtn" class="secondary">重新生成全部 Prompt</button>
+          </div>
+        </section>
+
+        <section class="panel result-panel">
+          <div class="panel-title">
+            <h2>4. 拆段结果</h2>
+            <p>每一段默认输出固定结构：时间、画面、镜头运动、旁白。段内仍保留逐镜头时间轴，方便你核对后直接复制给 Seedance。</p>
+          </div>
+
+          <div id="emptyState" class="empty-state">
+            导入一个 2 分钟内视频后，点击“生成拆段结果”开始。
+          </div>
+          <div id="segmentsContainer" class="segments"></div>
+        </section>
+      </main>
+    </div>
+
+    <template id="segmentTemplate">
+      <article class="segment-card">
+        <div class="segment-header">
+          <div>
+            <h3 class="segment-title"></h3>
+            <p class="segment-time"></p>
+          </div>
+          <button class="copy-btn secondary">复制本段成品</button>
+        </div>
+
+        <div class="segment-body">
+          <div class="thumb-wrap">
+            <img class="segment-thumb" alt="分段缩略图" />
+          </div>
+
+          <div class="segment-fields">
+            <label class="field">
+              <span>段落定位</span>
+              <input class="segment-role" type="text" />
+            </label>
+
+            <label class="field">
+              <span>段内逐镜头脚本</span>
+              <textarea class="segment-breakdown" rows="5"></textarea>
+            </label>
+
+            <label class="field">
+              <span>段落画面</span>
+              <textarea class="segment-scene" rows="2"></textarea>
+            </label>
+
+            <label class="field">
+              <span>段落旁白</span>
+              <textarea class="segment-action" rows="2"></textarea>
+            </label>
+
+            <label class="field">
+              <span>OCR 参考</span>
+              <textarea class="segment-ocr" rows="2" placeholder="未识别到文字时可留空"></textarea>
+            </label>
+
+            <label class="field">
+              <span>段落镜头运动</span>
+              <input class="segment-camera" type="text" />
+            </label>
+
+            <label class="field">
+              <span>Seedance 结构化提示词</span>
+              <textarea class="segment-prompt prompt-output" rows="6" readonly></textarea>
+            </label>
+
+            <div class="inline-row">
+              <button class="download-btn">导出本段 MP4</button>
+              <button class="refresh-btn">重生成本段</button>
+            </div>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+  </html>
